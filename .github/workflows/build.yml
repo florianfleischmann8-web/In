@@ -1,0 +1,457 @@
+name: Build DoorIR APK (Komplett-Projekt in dieser Datei)
+
+# Diese einzige Datei enthaelt den kompletten App-Code.
+# Ablegen unter: .github/workflows/build.yml  -> pushen -> Actions -> APK-Artifact laden.
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Projekt erzeugen
+        run: |
+          set -e
+          mkdir -p DoorIR && cd DoorIR
+          cat > settings.gradle.kts <<'DOORIR_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral(); maven("https://jitpack.io") }
+          }
+          rootProject.name = "DoorIR"
+          include(":app")
+          DOORIR_EOF
+          cat > build.gradle.kts <<'DOORIR_EOF'
+          plugins {
+              id("com.android.application") version "8.5.0" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          DOORIR_EOF
+          cat > gradle.properties <<'DOORIR_EOF'
+          org.gradle.jvmargs=-Xmx3g
+          android.useAndroidX=true
+          kotlin.code.style=official
+          DOORIR_EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'DOORIR_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.doorir"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.doorir"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+              composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+          }
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.material:material-icons-extended")
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation("com.github.mik3y:usb-serial-for-android:3.8.0")
+          }
+          DOORIR_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'DOORIR_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.NFC" />
+              <uses-permission android:name="android.permission.TRANSMIT_IR" />
+              <uses-feature android:name="android.hardware.nfc" android:required="false" />
+              <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+              <uses-feature android:name="android.hardware.consumerir" android:required="false" />
+
+              <application
+                  android:label="DoorIR"
+                  android:theme="@style/Theme.DoorIR">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTop">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                          android:resource="@xml/device_filter" />
+                  </activity>
+              </application>
+          </manifest>
+          DOORIR_EOF
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/device_filter.xml <<'DOORIR_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <usb-device />
+          </resources>
+          DOORIR_EOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/themes.xml <<'DOORIR_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="Theme.DoorIR" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:windowBackground">#05060F</item>
+                  <item name="android:statusBarColor">#05060F</item>
+                  <item name="android:navigationBarColor">#05060F</item>
+              </style>
+          </resources>
+          DOORIR_EOF
+          mkdir -p app/src/main/java/com/example/doorir
+          cat > app/src/main/java/com/example/doorir/MainActivity.kt <<'DOORIR_EOF'
+          package com.example.doorir
+
+          import android.app.PendingIntent
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.hardware.ConsumerIrManager
+          import android.hardware.usb.UsbDevice
+          import android.hardware.usb.UsbManager
+          import android.nfc.NfcAdapter
+          import android.nfc.Tag
+          import android.nfc.tech.*
+          import android.os.Build
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.BorderStroke
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.text.font.FontFamily
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import com.hoho.android.usbserial.driver.UsbSerialPort
+          import com.hoho.android.usbserial.driver.UsbSerialProber
+
+          // ---------- Farben ----------
+          val Bg = Color(0xFF05060F); val Card = Color(0xFF0E1124)
+          val Cyan = Color(0xFF00E5FF); val Pink = Color(0xFFFF2E93); val Lime = Color(0xFFB6FF3B)
+
+          data class UsbInfo(val dev: UsbDevice, val name: String, val ids: String, val cls: String, val perm: Boolean, val serial: Boolean)
+          data class NfcInfo(val uid: String, val techs: String, val type: String, val ndef: String)
+
+          class AppState {
+              val usb = mutableStateListOf<UsbInfo>()
+              var nfc by mutableStateOf<NfcInfo?>(null)
+              val log = mutableStateListOf<String>()
+              var hasIr by mutableStateOf(false)
+              var hasNfc by mutableStateOf(false)
+              fun say(s: String) { log.add(0, s); if (log.size > 40) log.removeLast() }
+          }
+
+          class MainActivity : ComponentActivity() {
+              private val st = AppState()
+              private lateinit var usbMgr: UsbManager
+              private var nfcAdapter: NfcAdapter? = null
+              private var ir: ConsumerIrManager? = null
+              private val ACTION_PERM = "com.example.doorir.USB_PERM"
+
+              private val usbReceiver = object : BroadcastReceiver() {
+                  override fun onReceive(c: Context, i: Intent) {
+                      when (i.action) {
+                          UsbManager.ACTION_USB_DEVICE_ATTACHED -> st.say("🔌 USB-Gerät angesteckt")
+                          UsbManager.ACTION_USB_DEVICE_DETACHED -> st.say("⏏️ USB-Gerät entfernt")
+                          ACTION_PERM -> st.say(if (i.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) "✅ USB-Erlaubnis erteilt" else "❌ USB-Erlaubnis abgelehnt")
+                      }
+                      refreshUsb()
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  usbMgr = getSystemService(Context.USB_SERVICE) as UsbManager
+                  nfcAdapter = NfcAdapter.getDefaultAdapter(this)
+                  ir = getSystemService(Context.CONSUMER_IR_SERVICE) as? ConsumerIrManager
+                  st.hasIr = ir?.hasIrEmitter() == true
+                  st.hasNfc = nfcAdapter?.isEnabled == true
+                  val f = IntentFilter().apply {
+                      addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+                      addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
+                      addAction(ACTION_PERM)
+                  }
+                  if (Build.VERSION.SDK_INT >= 33) registerReceiver(usbReceiver, f, RECEIVER_NOT_EXPORTED)
+                  else registerReceiver(usbReceiver, f)
+                  refreshUsb()
+                  setContent { DoorApp(st, ::requestPerm, ::sendSerial, ::sendIrNec) }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  refreshUsb()
+                  nfcAdapter?.enableReaderMode(this, { tag -> readTag(tag) },
+                      NfcAdapter.FLAG_READER_NFC_A or NfcAdapter.FLAG_READER_NFC_B or
+                          NfcAdapter.FLAG_READER_NFC_F or NfcAdapter.FLAG_READER_NFC_V or
+                          NfcAdapter.FLAG_READER_NO_PLATFORM_SOUNDS, null)
+              }
+
+              override fun onPause() { super.onPause(); nfcAdapter?.disableReaderMode(this) }
+              override fun onDestroy() { super.onDestroy(); unregisterReceiver(usbReceiver) }
+
+              // ---------- USB-C Erkennung ----------
+              private fun refreshUsb() {
+                  val prober = UsbSerialProber.getDefaultProber()
+                  val list = usbMgr.deviceList.values.map { d ->
+                      UsbInfo(d, d.productName ?: d.deviceName,
+                          "VID %04X · PID %04X".format(d.vendorId, d.productId),
+                          className(d.deviceClass), usbMgr.hasPermission(d), prober.probeDevice(d) != null)
+                  }
+                  runOnUiThread { st.usb.clear(); st.usb.addAll(list) }
+              }
+
+              private fun className(c: Int) = when (c) {
+                  0 -> "Interface-definiert"; 1 -> "Audio"; 2 -> "CDC/Seriell"; 3 -> "HID"
+                  8 -> "Speicher"; 9 -> "Hub"; 0xE -> "Video"; 0xFF -> "Herstellerspezifisch"; else -> "Klasse $c"
+              }
+
+              private fun requestPerm(d: UsbDevice) {
+                  val pi = PendingIntent.getBroadcast(this, 0, Intent(ACTION_PERM).setPackage(packageName),
+                      PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+                  usbMgr.requestPermission(d, pi)
+              }
+
+              // Sendet einen Text-Befehl an einen seriellen USB-IR-Dongle (z. B. Arduino/ESP/CP210x-Bauart)
+              private fun sendSerial(text: String) {
+                  val drv = UsbSerialProber.getDefaultProber().findAllDrivers(usbMgr)
+                      .firstOrNull { usbMgr.hasPermission(it.device) }
+                  if (drv == null) { st.say("⚠️ Kein serieller Dongle mit Erlaubnis gefunden"); return }
+                  try {
+                      val con = usbMgr.openDevice(drv.device) ?: run { st.say("⚠️ Öffnen fehlgeschlagen"); return }
+                      val port: UsbSerialPort = drv.ports[0]
+                      port.open(con)
+                      port.setParameters(115200, 8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE)
+                      port.write((text + "\n").toByteArray(), 1000)
+                      port.close()
+                      st.say("📡 USB-Dongle ← $text")
+                  } catch (e: Exception) { st.say("❌ ${e.message}") }
+              }
+
+              // ---------- Eingebauter IR-Sender (falls Handy einen hat) ----------
+              private fun sendIrNec(addr: Int, cmd: Int, samsung: Boolean) {
+                  val c = ir
+                  if (c == null || !c.hasIrEmitter()) { st.say("⚠️ Kein IR-Sender im Gerät – nutze USB-Dongle-Tab"); return }
+                  val hdr = if (samsung) 4500 else 9000
+                  val p = ArrayList<Int>()
+                  p += hdr; p += 4500
+                  val data = (addr and 0xFF) or ((addr.inv() and 0xFF) shl 8) or ((cmd and 0xFF) shl 16) or ((cmd.inv() and 0xFF) shl 24)
+                  for (i in 0 until 32) { p += 560; p += if (((data shr i) and 1) == 1) 1690 else 560 }
+                  p += 560
+                  c.transmit(38000, p.toIntArray())
+                  st.say("📡 IR gesendet: addr=%02X cmd=%02X".format(addr, cmd))
+              }
+
+              // ---------- NFC lesen (nur Identifikation, kein Klonen) ----------
+              private fun readTag(tag: Tag) {
+                  val uid = tag.id.joinToString(":") { "%02X".format(it) }
+                  val techs = tag.techList.joinToString { it.substringAfterLast('.') }
+                  val type = when {
+                      tag.techList.contains(MifareClassic::class.java.name) -> "MIFARE Classic (älteres System, oft Hotel/Haus-Türen)"
+                      tag.techList.contains(IsoDep::class.java.name) -> "ISO-DEP (z. B. DESFire / Smartcard, verschlüsselt)"
+                      tag.techList.contains(MifareUltralight::class.java.name) -> "MIFARE Ultralight / NTAG"
+                      tag.techList.contains(NfcV::class.java.name) -> "ISO 15693 (NfcV)"
+                      tag.techList.contains(NfcF::class.java.name) -> "FeliCa (NfcF)"
+                      else -> "Unbekannt"
+                  }
+                  val ndef = try {
+                      Ndef.get(tag)?.let { n ->
+                          n.connect(); val m = n.ndefMessage; n.close()
+                          m?.records?.joinToString(" | ") { r -> String(r.payload).filter { it.code in 32..126 } } ?: "leer"
+                      } ?: "kein NDEF"
+                  } catch (e: Exception) { "nicht lesbar" }
+                  runOnUiThread { st.nfc = NfcInfo(uid, techs, type, ndef); st.say("📶 NFC erkannt: $uid") }
+              }
+          }
+
+          // =================== UI ===================
+          @Composable
+          fun DoorApp(st: AppState, askPerm: (UsbDevice) -> Unit, sendSerial: (String) -> Unit, sendIr: (Int, Int, Boolean) -> Unit) {
+              var tab by remember { mutableIntStateOf(0) }
+              MaterialTheme(colorScheme = darkColorScheme(primary = Cyan, background = Bg, surface = Card)) {
+                  Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF0B0F2B), Bg, Color(0xFF14061F))))) {
+                      Scaffold(containerColor = Color.Transparent,
+                          bottomBar = {
+                              NavigationBar(containerColor = Card.copy(alpha = .95f)) {
+                                  listOf(Icons.Filled.Usb to "USB-C", Icons.Filled.Nfc to "NFC", Icons.Filled.SettingsRemote to "Remote").forEachIndexed { i, (ic, l) ->
+                                      NavigationBarItem(selected = tab == i, onClick = { tab = i }, icon = { Icon(ic, l) }, label = { Text(l) },
+                                          colors = NavigationBarItemDefaults.colors(selectedIconColor = Bg, indicatorColor = Cyan, selectedTextColor = Cyan))
+                                  }
+                              }
+                          }) { pad ->
+                          Column(Modifier.padding(pad).padding(16.dp).fillMaxSize()) {
+                              Text("DOOR·IR", fontSize = 34.sp, fontWeight = FontWeight.Black, color = Cyan, fontFamily = FontFamily.Monospace)
+                              Text("Signal-Scanner & Fernbedienung", color = Pink, fontSize = 13.sp)
+                              Spacer(Modifier.height(14.dp))
+                              when (tab) {
+                                  0 -> UsbTab(st, askPerm)
+                                  1 -> NfcTab(st)
+                                  else -> RemoteTab(st, sendSerial, sendIr)
+                              }
+                              Spacer(Modifier.height(8.dp))
+                              LogBox(st)
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun Neon(color: Color = Cyan, content: @Composable ColumnScope.() -> Unit) {
+              Card(Modifier.fillMaxWidth().padding(vertical = 5.dp), shape = RoundedCornerShape(18.dp),
+                  colors = CardDefaults.cardColors(containerColor = Card), border = BorderStroke(1.5.dp, color.copy(alpha = .8f))) {
+                  Column(Modifier.padding(14.dp), content = content)
+              }
+          }
+
+          @Composable
+          fun UsbTab(st: AppState, askPerm: (UsbDevice) -> Unit) {
+              Neon(if (st.usb.isEmpty()) Pink else Lime) {
+                  Text(if (st.usb.isEmpty()) "Kein USB-C-Gerät erkannt" else "${st.usb.size} Gerät(e) verbunden",
+                      fontWeight = FontWeight.Bold, fontSize = 18.sp, color = Color.White)
+                  Text("Dongle einstecken – wird automatisch erkannt.", color = Color.Gray, fontSize = 12.sp)
+              }
+              LazyColumn {
+                  items(st.usb) { u ->
+                      Neon(Cyan) {
+                          Text(u.name, fontWeight = FontWeight.Bold, color = Color.White)
+                          Text(u.ids, fontFamily = FontFamily.Monospace, color = Cyan, fontSize = 12.sp)
+                          Text("${u.cls}${if (u.serial) " · serieller IR-/Adapter-Treiber ✓" else ""}", color = Color.Gray, fontSize = 12.sp)
+                          Spacer(Modifier.height(8.dp))
+                          if (u.perm) Text("✅ Zugriff erlaubt", color = Lime)
+                          else Button(onClick = { askPerm(u.dev) }, colors = ButtonDefaults.buttonColors(containerColor = Cyan, contentColor = Bg)) { Text("Zugriff erlauben") }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun NfcTab(st: AppState) {
+              Neon(if (st.hasNfc) Lime else Pink) {
+                  Text(if (st.hasNfc) "NFC bereit – Karte/Tag ans Handy halten" else "NFC ist aus oder nicht vorhanden",
+                      fontWeight = FontWeight.Bold, color = Color.White)
+              }
+              st.nfc?.let { n ->
+                  Neon(Pink) {
+                      Text("UID", color = Color.Gray, fontSize = 11.sp)
+                      Text(n.uid, fontFamily = FontFamily.Monospace, color = Cyan, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                      Spacer(Modifier.height(6.dp))
+                      Text("Typ: ${n.type}", color = Color.White)
+                      Text("Techniken: ${n.techs}", color = Color.Gray, fontSize = 12.sp)
+                      Text("NDEF: ${n.ndef}", color = Color.Gray, fontSize = 12.sp)
+                  }
+              }
+          }
+
+          @Composable
+          fun RemoteTab(st: AppState, sendSerial: (String) -> Unit, sendIr: (Int, Int, Boolean) -> Unit) {
+              var addr by remember { mutableStateOf("00") }
+              var cmd by remember { mutableStateOf("00") }
+              var serialCmd by remember { mutableStateOf("NEC 00 00") }
+              LazyColumn {
+                  item {
+                      Neon(Cyan) {
+                          Text("Fernseher (eingebauter IR-Sender)", fontWeight = FontWeight.Bold, color = Color.White)
+                          Text(if (st.hasIr) "IR-Sender gefunden ✓" else "Kein IR-Sender im Handy", color = if (st.hasIr) Lime else Pink, fontSize = 12.sp)
+                          Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                              NeonBtn("LG Power", Modifier.weight(1f)) { sendIr(0x04, 0x08, false) }
+                              NeonBtn("Samsung Power", Modifier.weight(1f)) { sendIr(0x07, 0x02, true) }
+                          }
+                      }
+                      Neon(Pink) {
+                          Text("Beamer / eigener NEC-Code", fontWeight = FontWeight.Bold, color = Color.White)
+                          Text("Adresse & Befehl in Hex (aus der Beamer-Doku)", color = Color.Gray, fontSize = 12.sp)
+                          Row(Modifier.padding(top = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                              OutlinedTextField(addr, { addr = it.take(2) }, Modifier.weight(1f), label = { Text("Addr") }, singleLine = true)
+                              OutlinedTextField(cmd, { cmd = it.take(2) }, Modifier.weight(1f), label = { Text("Cmd") }, singleLine = true)
+                          }
+                          NeonBtn("Beamer senden", Modifier.fillMaxWidth().padding(top = 8.dp)) {
+                              val a = addr.toIntOrNull(16); val c = cmd.toIntOrNull(16)
+                              if (a != null && c != null) sendIr(a, c, false) else st.say("⚠️ Ungültiger Hex-Wert")
+                          }
+                      }
+                      Neon(Lime) {
+                          Text("USB-C-IR-Dongle (seriell)", fontWeight = FontWeight.Bold, color = Color.White)
+                          Text("Sendet den Text unten per USB-Seriell (115200 Baud). Format musst du an die Firmware deines Dongles anpassen.", color = Color.Gray, fontSize = 12.sp)
+                          OutlinedTextField(serialCmd, { serialCmd = it }, Modifier.fillMaxWidth().padding(top = 6.dp), singleLine = true, label = { Text("Befehl") })
+                          Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                              NeonBtn("TV AN/AUS", Modifier.weight(1f)) { sendSerial("NEC 04 08") }
+                              NeonBtn("Beamer AN/AUS", Modifier.weight(1f)) { sendSerial(serialCmd) }
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun NeonBtn(t: String, m: Modifier, onClick: () -> Unit) =
+              Button(onClick, m, shape = RoundedCornerShape(12.dp),
+                  colors = ButtonDefaults.buttonColors(containerColor = Cyan, contentColor = Bg)) { Text(t, fontWeight = FontWeight.Bold) }
+
+          @Composable
+          fun LogBox(st: AppState) {
+              Card(Modifier.fillMaxWidth().height(90.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFF080A18)),
+                  border = BorderStroke(1.dp, Color(0xFF222645))) {
+                  LazyColumn(Modifier.padding(8.dp)) {
+                      items(st.log) { Text(it, color = Lime, fontFamily = FontFamily.Monospace, fontSize = 11.sp) }
+                  }
+              }
+          }
+          DOORIR_EOF
+
+      - name: APK bauen
+        working-directory: DoorIR
+        run: gradle assembleDebug --stacktrace
+
+      - name: APK hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: DoorIR-debug-apk
+          path: DoorIR/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
